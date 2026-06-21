@@ -1,11 +1,12 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include "wifi_config.h"
 
 // ======================================================
-// CONFIGURACIÓN WIFI
+// CONFIGURACIÓN WIFI (desde wifi_config.h)
 // ======================================================
-const char* ssid = "CAPI";
-const char* password = "NOAH2016";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 // ======================================================
 // CONFIGURACIÓN RELÉ
