@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
 """
 CPU Temperature Monitor for ESP32 Fan Controller.
-Reads CPU temperature via psutil and sends it to an ESP32 via HTTP POST.
+Reads CPU temperature via psutil (with sysfs fallback) and sends it to an ESP32.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import socket
 import sys
 import time
 from dataclasses import dataclass, field
-from logging.handlers import RotatingFileHandler
-from typing import Optional
+from pathlib import Path
+from typing import Iterable, Optional
 
 import psutil
 import requests
-
-
-# ======================================================
-# CONFIG
-# ======================================================
 
 
 @dataclass
 class Config:
     esp32_ip: str = field(
         default_factory=lambda: os.getenv("ESP32_IP", "192.168.1.103")
+    )
+    esp32_url: str = field(
+        default_factory=lambda: os.getenv("ESP32_URL", "")
     )
     interval_seconds: float = float(os.getenv("INTERVAL_SECONDS", "5"))
     http_timeout_connect: float = float(os.getenv("HTTP_TIMEOUT_CONNECT", "2"))
@@ -40,11 +39,17 @@ class Config:
     max_consecutive_failures: int = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5"))
     backoff_base_seconds: float = 1.0
     backoff_max_seconds: float = 60.0
-    log_file: Optional[str] = os.getenv("LOG_FILE")
+    log_file: str = os.getenv("LOG_FILE", "logs/fan-controller.log")
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    temp_source: str = os.getenv("TEMP_SOURCE", "auto")
+    api_key: str = os.getenv("API_KEY", "")
+    verify_ssl: bool = os.getenv("VERIFY_SSL", "false").lower() in {"1", "true", "yes", "on", "si"}
+    oneshot: bool = False
 
     @property
     def endpoint(self) -> str:
+        if self.esp32_url:
+            return self.esp32_url.rstrip("/") + "/api/cpu"
         return f"http://{self.esp32_ip}/api/cpu"
 
     @property
@@ -52,21 +57,45 @@ class Config:
         return (self.http_timeout_connect, self.http_timeout_read)
 
 
+def load_env_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def build_config(argv: Optional[list[str]] = None) -> Config:
     parser = argparse.ArgumentParser(
         description="Monitor de temperatura CPU para ESP32 Fan Controller"
     )
     parser.add_argument("--ip", help="Dirección IP del ESP32")
+    parser.add_argument("--url", help="URL base del ESP32 (alternativa a --ip)")
     parser.add_argument("--interval", type=float, help="Intervalo de envío (segundos)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Log level DEBUG")
     parser.add_argument("--log-file", help="Ruta al archivo de log")
     parser.add_argument("--delta", type=float, help="Umbral mínimo de cambio (°C)")
+    parser.add_argument("--env-file", default=".env", help="Ruta del archivo .env")
+    parser.add_argument("--oneshot", action="store_true", help="Ejecuta un solo ciclo y termina")
+    parser.add_argument("--temp-source", choices=["auto", "psutil", "sysfs"],
+                        help="Fuente de temperatura")
     parsed = parser.parse_args(argv)
+
+    load_env_file(Path(parsed.env_file))
 
     config = Config()
 
     if parsed.ip:
         config.esp32_ip = parsed.ip
+    if parsed.url:
+        config.esp32_url = parsed.url
     if parsed.interval is not None:
         config.interval_seconds = parsed.interval
     if parsed.verbose:
@@ -75,13 +104,12 @@ def build_config(argv: Optional[list[str]] = None) -> Config:
         config.log_file = parsed.log_file
     if parsed.delta is not None:
         config.temp_delta_threshold = parsed.delta
+    if parsed.temp_source:
+        config.temp_source = parsed.temp_source
+    if parsed.oneshot:
+        config.oneshot = True
 
     return config
-
-
-# ======================================================
-# LOGGING
-# ======================================================
 
 
 def setup_logging(config: Config) -> None:
@@ -92,25 +120,21 @@ def setup_logging(config: Config) -> None:
     console.setLevel(level)
     handlers.append(console)
 
-    if config.log_file:
-        file_handler = RotatingFileHandler(
-            config.log_file,
-            maxBytes=1_000_000,
-            backupCount=3,
-        )
-        file_handler.setLevel(level)
-        handlers.append(file_handler)
+    log_path = Path(config.log_file)
+    ensure_parent(log_path)
+    file_handler = RotatingFileHandler(
+        str(log_path),
+        maxBytes=1_000_000,
+        backupCount=3,
+    )
+    file_handler.setLevel(level)
+    handlers.append(file_handler)
 
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=handlers,
     )
-
-
-# ======================================================
-# METRICS
-# ======================================================
 
 
 @dataclass
@@ -123,11 +147,6 @@ class Metrics:
     last_success_time: Optional[float] = None
 
 
-# ======================================================
-# HELPERS
-# ======================================================
-
-
 def get_hostname() -> str:
     try:
         return socket.gethostname()
@@ -135,52 +154,119 @@ def get_hostname() -> str:
         return "unknown"
 
 
-def read_cpu_temperature(config: Config) -> Optional[float]:
-    try:
-        sensors = psutil.sensors_temperatures(fahrenheit=False)
-    except Exception as exc:
-        logging.error("No se pudo leer sensors_temperatures: %s", exc)
-        return None
-
-    if not sensors:
-        logging.warning("No hay sensores de temperatura disponibles.")
-        return None
-
-    readings = []
-    for sensor_name, entries in sensors.items():
+def collect_temp_candidates_from_psutil() -> list[tuple[str, float]]:
+    candidates: list[tuple[str, float]] = []
+    all_temps = psutil.sensors_temperatures(fahrenheit=False)
+    for chip_name, entries in all_temps.items():
         for entry in entries:
-            temp = entry.current
-            if temp is None:
+            label = (entry.label or "").lower()
+            current = entry.current
+            if current is None:
                 continue
-            if config.min_valid_temp <= temp <= config.max_valid_temp:
-                readings.append((sensor_name, entry.label, float(temp)))
+            label_full = f"{chip_name}:{label}" if label else chip_name
+            candidates.append((label_full, float(current)))
+    return candidates
 
-    if not readings:
-        logging.warning("No se encontraron lecturas válidas de temperatura.")
+
+def select_best_temp(candidates: Iterable[tuple[str, float]]) -> Optional[tuple[str, float]]:
+    items = list(candidates)
+    if not items:
         return None
 
-    hottest = max(readings, key=lambda x: x[2])
-    sensor_name, label, temp = hottest
+    priority_terms = [
+        "package id 0",
+        "tdie",
+        "tctl",
+        "cpu",
+        "coretemp",
+        "k10temp",
+        "soc",
+    ]
 
-    logging.info(
-        "Temperatura seleccionada: %.1f °C | sensor=%s | label=%s",
-        temp,
-        sensor_name,
-        label or "-",
-    )
-    return temp
+    for term in priority_terms:
+        preferred = [item for item in items if term in item[0]]
+        if preferred:
+            return max(preferred, key=lambda x: x[1])
+
+    return max(items, key=lambda x: x[1])
+
+
+def read_temp_psutil() -> tuple[Optional[float], str]:
+    try:
+        selected = select_best_temp(collect_temp_candidates_from_psutil())
+        if selected is None:
+            return None, "psutil:no-data"
+        source, value = selected
+        return value, f"psutil:{source}"
+    except Exception as exc:
+        return None, f"psutil:error:{exc}"
+
+
+def read_temp_sysfs() -> tuple[Optional[float], str]:
+    base = Path("/sys/class/thermal")
+    if not base.exists():
+        return None, "sysfs:not-found"
+
+    best_value: Optional[float] = None
+    best_source = "sysfs:unknown"
+
+    for zone in sorted(base.glob("thermal_zone*")):
+        temp_file = zone / "temp"
+        type_file = zone / "type"
+        if not temp_file.exists():
+            continue
+        try:
+            raw = temp_file.read_text(encoding="utf-8").strip()
+            value = float(raw)
+            if value > 1000:
+                value = value / 1000.0
+            ztype = type_file.read_text(encoding="utf-8").strip() if type_file.exists() else zone.name
+            source = f"sysfs:{zone.name}:{ztype}"
+            if best_value is None or value > best_value:
+                best_value = value
+                best_source = source
+        except Exception:
+            continue
+
+    if best_value is None:
+        return None, "sysfs:no-valid-zones"
+    return best_value, best_source
+
+
+def read_cpu_temperature(config: Config) -> tuple[Optional[float], str]:
+    readers = {
+        "psutil": [read_temp_psutil],
+        "sysfs": [read_temp_sysfs],
+        "auto": [read_temp_psutil, read_temp_sysfs],
+    }
+    selected_readers = readers.get(config.temp_source, readers["auto"])
+
+    for reader in selected_readers:
+        value, source = reader()
+        if value is not None:
+            if config.min_valid_temp <= value <= config.max_valid_temp:
+                return value, source
+            logging.debug("Lectura %s fuera de rango [%.1f, %.1f]: %.2f",
+                          source, config.min_valid_temp, config.max_valid_temp, value)
+
+    return None, "no-valid-reading"
 
 
 def send_temperature(
     session: requests.Session,
     temp: float,
+    source: str,
     config: Config,
     metrics: Metrics,
 ) -> bool:
     payload = {
         "temp": round(temp, 1),
         "host": get_hostname(),
+        "source": source,
     }
+
+    if config.api_key:
+        payload["api_key"] = config.api_key
 
     try:
         response = session.post(
@@ -209,7 +295,7 @@ def send_temperature(
     metrics.last_temp_sent = temp
     metrics.last_success_time = time.time()
 
-    logging.info("Enviado a ESP32: %s | Respuesta: %s", payload, response.text.strip())
+    logging.info("Enviado a ESP32: %s | fuente=%s | Respuesta: %s", payload, source, response.text.strip())
     return True
 
 
@@ -229,10 +315,6 @@ def compute_sleep(metrics: Metrics, config: Config) -> float:
     return min(backoff, config.backoff_max_seconds)
 
 
-# ======================================================
-# MAIN
-# ======================================================
-
 _should_exit = False
 
 
@@ -250,12 +332,12 @@ def main() -> None:
 
     logging.info("Iniciando monitor de temperatura CPU para ESP32")
     logging.info(
-        "Endpoint=%s  Intervalo=%.1fs  Umbral-delta=%.1f°C  Timeout=(%.1f,%.1f)s",
+        "Endpoint=%s  Intervalo=%.1fs  TempSource=%s  ApiKey=%s  Umbral-delta=%.1f°C",
         config.endpoint,
         config.interval_seconds,
+        config.temp_source,
+        "si" if config.api_key else "no",
         config.temp_delta_threshold,
-        config.http_timeout_connect,
-        config.http_timeout_read,
     )
 
     signal.signal(signal.SIGINT, _handle_signal)
@@ -269,11 +351,11 @@ def main() -> None:
     while not _should_exit:
         cycle_start = time.monotonic()
 
-        temp = read_cpu_temperature(config)
+        temp, source = read_cpu_temperature(config)
 
         if temp is not None:
             if last_temp is None or abs(temp - last_temp) >= config.temp_delta_threshold:
-                send_temperature(session, temp, config, metrics)
+                send_temperature(session, temp, source, config, metrics)
                 last_temp = temp
             else:
                 logging.debug(
@@ -282,7 +364,10 @@ def main() -> None:
                     config.temp_delta_threshold,
                 )
         else:
-            logging.debug("No se pudo leer temperatura en este ciclo")
+            logging.debug("No se pudo leer temperatura en este ciclo: %s", source)
+
+        if config.oneshot:
+            break
 
         sleep_time = compute_sleep(metrics, config)
         elapsed = time.monotonic() - cycle_start
