@@ -1,33 +1,32 @@
-# ESP32 Fan Controller
-
-[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python)](https://python.org)
-[![Arduino](https://img.shields.io/badge/Arduino-ESP32-00979D?logo=arduino)](https://www.arduino.cc/)
-[![CI](https://github.com/drbash/esp32-fan-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/drbash/esp32-fan-controller/actions)
+# esp32-fan-controller
 
 Monitor de temperatura CPU que envía datos a un ESP32 para control de ventilación vía HTTP POST. Incluye firmware Arduino para el receptor ESP32 con control de relé y página web de administración.
 
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python)](https://python.org)
+[![Arduino](https://img.shields.io/badge/Arduino-ESP32-00979D?logo=arduino)](https://www.arduino.cc/)
+[![CI](https://github.com/bi0punk/esp32-fan-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/bi0punk/esp32-fan-controller/actions)
+[![Licencia](https://img.shields.io/badge/Licencia-MIT-yellow)](LICENSE)
+
 ## Contenido
 
-- [Características](#caracter%C3%ADsticas)
+- [Características](#características)
+- [Arquitectura](#arquitectura)
 - [Stack](#stack)
-- [Estructura](#estructura)
-- [Requisitos](#requisitos)
-- [Instalación](#instalaci%C3%B3n)
+- [Estructura del repositorio](#estructura-del-repositorio)
+- [Instalación](#instalación)
 - [Uso](#uso)
 - [Firmware ESP32](#firmware-esp32)
 - [API del ESP32](#api-del-esp32)
-- [Modos de operación](#modos-de-operaci%C3%B3n)
-- [Tests](#tests)
-- [Configuración](#configuraci%C3%B3n)
-- [CI/CD](#cicd)
+- [Modos de operación](#modos-de-operación)
+- [Configuración](#configuración)
+- [Tests / CI](#tests--ci)
 - [systemd](#systemd)
-- [Limitaciones / Roadmap](#limitaciones--roadmap)
+- [Roadmap](#roadmap)
 - [Licencia](#licencia)
 
 ## Características
 
-- **Monitoreo CPU**: lectura de temperatura con `psutil`
+- **Monitoreo CPU**: lectura de temperatura con `psutil` (con fallback a sysfs)
 - **Backoff exponencial**: ante fallos de conexión (1s → 2s → 4s → 8s…)
 - **Filtro delta**: evita envíos si temperatura no cambió significativamente
 - **Graceful shutdown**: captura SIGINT/SIGTERM, cierra limpiamente
@@ -35,6 +34,19 @@ Monitor de temperatura CPU que envía datos a un ESP32 para control de ventilaci
 - **Histeresis**: evita oscilaciones del relé cerca del umbral
 - **Logging rotativo**: opcionalmente escribe a archivo con rotación (1 MB, 3 backups)
 - **Config flexible**: variables de entorno + CLI + defaults
+
+## Arquitectura
+
+```mermaid
+flowchart TD
+  CPU[CPU con sensor de temperatura] -->|psutil / sysfs| MON[Monitor Python app.py]
+  MON -->|POST JSON temp/host/source| ESP32[ESP32 + WebServer :80]
+  ESP32 -->|control relé GPIO 26 activo LOW| FAN[Ventilador]
+  BROWSER[Navegador] -->|GET /| ESP32
+  BROWSER -->|POST /api/mode/*| ESP32
+```
+
+Flujo: el monitor en la máquina host lee la temperatura de la CPU, la envía por HTTP POST al endpoint `/api/cpu` del ESP32; el firmware aplica lógica auto (histéresis con `TEMP_ON`/`TEMP_OFF`), conmuta el relé y expone una página web de control.
 
 ## Stack
 
@@ -46,7 +58,7 @@ Monitor de temperatura CPU que envía datos a un ESP32 para control de ventilaci
 | Control | Relé (GPIO 26, activo LOW) |
 | Testing | pytest (Python) |
 
-## Estructura
+## Estructura del repositorio
 
 ```
 esp32-fan-controller/
@@ -65,20 +77,18 @@ esp32-fan-controller/
 └── README.md
 ```
 
-## Requisitos
+## Instalación
 
-### Monitor Python
+### Requisitos
 
+Monitor Python:
 - Python 3.11+
 - CPU con sensor de temperatura
 
-### ESP32
-
+ESP32:
 - Placa ESP32 (ESP32-WROOM, ESP32-S, etc.)
 - Relé (activo en LOW) conectado a GPIO 26
 - Arduino IDE o PlatformIO para flashear
-
-## Instalación
 
 ### Monitor Python
 
@@ -111,7 +121,7 @@ python app.py --ip 10.0.0.5 --interval 10 --verbose
 |---|---|
 | GPIO 26 | Relé (activo en LOW) |
 
-### API del ESP32
+## API del ESP32
 
 | Método | Ruta | Descripción |
 |---|---|---|
@@ -122,19 +132,12 @@ python app.py --ip 10.0.0.5 --interval 10 --verbose
 | POST | `/api/mode/on` | Forzar encendido |
 | POST | `/api/mode/off` | Forzar apagado |
 
-### Modos de operación
+## Modos de operación
 
 - **AUTO** — Enciende ventilador cuando `temp >= TEMP_ON` (65°C), apaga cuando `temp <= TEMP_OFF` (55°C)
 - **FORCE_ON** — Ventilador siempre encendido
 - **FORCE_OFF** — Ventilador siempre apagado
 - **Fail-safe:** Si no recibe datos del sensor por 30s, enciende el ventilador automáticamente
-
-## Tests
-
-```bash
-pip install pytest
-pytest tests/ -v
-```
 
 ## Configuración
 
@@ -149,9 +152,14 @@ pytest tests/ -v
 | `LOG_LEVEL` | `--verbose` | `INFO` | Nivel de logging |
 | `LOG_FILE` | `--log-file` | — | Ruta a archivo de log |
 
-## CI/CD
+## Tests / CI
 
-GitHub Actions ejecuta lint (Ruff) y tests (pytest) en cada push/PR.
+CI: GitHub Actions ejecuta lint (Ruff) y tests (pytest) en cada push/PR.
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
 
 ## systemd
 
@@ -172,7 +180,7 @@ EnvironmentFile=-/etc/default/esp32-monitor
 WantedBy=multi-user.target
 ```
 
-## Limitaciones / Roadmap
+## Roadmap
 
 - [x] Monitoreo de CPU + control ESP32
 - [x] Histeresis y backoff exponencial
@@ -185,4 +193,4 @@ WantedBy=multi-user.target
 
 ## Licencia
 
-MIT
+MIT — ver [LICENSE](LICENSE).
