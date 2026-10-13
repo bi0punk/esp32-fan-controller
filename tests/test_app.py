@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 import requests
 
 from app import (
@@ -15,10 +14,10 @@ from app import (
     send_temperature,
 )
 
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
 
 class TestBuildConfig:
     def test_defaults(self) -> None:
@@ -29,13 +28,19 @@ class TestBuildConfig:
         assert cfg.log_level == "INFO"
 
     def test_overrides(self) -> None:
-        cfg = build_config([
-            "--ip", "10.0.0.5",
-            "--interval", "10",
-            "--verbose",
-            "--delta", "1.0",
-            "--log-file", "/tmp/test.log",
-        ])
+        cfg = build_config(
+            [
+                "--ip",
+                "10.0.0.5",
+                "--interval",
+                "10",
+                "--verbose",
+                "--delta",
+                "1.0",
+                "--log-file",
+                "/tmp/test.log",
+            ]
+        )
         assert cfg.esp32_ip == "10.0.0.5"
         assert cfg.interval_seconds == 10.0
         assert cfg.log_level == "DEBUG"
@@ -55,6 +60,7 @@ class TestBuildConfig:
 # get_hostname
 # ---------------------------------------------------------------------------
 
+
 class TestGetHostname:
     @patch("app.socket.gethostname", return_value="my-pc")
     def test_returns_hostname(self, mock_gethostname: MagicMock) -> None:
@@ -68,6 +74,7 @@ class TestGetHostname:
 # ---------------------------------------------------------------------------
 # read_cpu_temperature
 # ---------------------------------------------------------------------------
+
 
 def _make_sensor_entry(current: float, label: str = "") -> MagicMock:
     entry = MagicMock()
@@ -87,8 +94,9 @@ class TestReadCpuTemperature:
             "acpitz": [_make_sensor_entry(38.0)],
         }
         with patch("app.psutil.sensors_temperatures", return_value=fake_sensors):
-            temp = read_cpu_temperature(cfg)
+            temp, source = read_cpu_temperature(cfg)
         assert temp == 52.0
+        assert source.startswith("psutil:")
 
     def test_filters_out_of_range(self) -> None:
         cfg = Config(min_valid_temp=1.0, max_valid_temp=100.0)
@@ -100,32 +108,37 @@ class TestReadCpuTemperature:
             ],
         }
         with patch("app.psutil.sensors_temperatures", return_value=fake_sensors):
-            temp = read_cpu_temperature(cfg)
-        assert temp == 55.0
+            with patch("app.read_temp_sysfs", return_value=(None, "sysfs:mock")):
+                temp, source = read_cpu_temperature(cfg)
+        assert temp is None
 
     def test_returns_none_when_no_valid_readings(self) -> None:
         cfg = Config()
         fake_sensors = {"coretemp": [_make_sensor_entry(999.0)]}
         with patch("app.psutil.sensors_temperatures", return_value=fake_sensors):
-            temp = read_cpu_temperature(cfg)
+            with patch("app.read_temp_sysfs", return_value=(None, "sysfs:mock")):
+                temp, source = read_cpu_temperature(cfg)
         assert temp is None
 
     def test_returns_none_when_no_sensors(self) -> None:
         cfg = Config()
         with patch("app.psutil.sensors_temperatures", return_value={}):
-            temp = read_cpu_temperature(cfg)
+            with patch("app.read_temp_sysfs", return_value=(None, "sysfs:mock")):
+                temp, source = read_cpu_temperature(cfg)
         assert temp is None
 
     def test_returns_none_on_exception(self) -> None:
         cfg = Config()
         with patch("app.psutil.sensors_temperatures", side_effect=OSError("denied")):
-            temp = read_cpu_temperature(cfg)
+            with patch("app.read_temp_sysfs", return_value=(None, "sysfs:mock")):
+                temp, source = read_cpu_temperature(cfg)
         assert temp is None
 
 
 # ---------------------------------------------------------------------------
 # send_temperature
 # ---------------------------------------------------------------------------
+
 
 class TestSendTemperature:
     def test_success(self) -> None:
@@ -137,7 +150,7 @@ class TestSendTemperature:
         response.text = "OK"
         session.post.return_value = response
 
-        result = send_temperature(session, 45.3, cfg, metrics)
+        result = send_temperature(session, 45.3, "sysfs:mock", cfg, metrics)
 
         assert result is True
         assert metrics.successful_requests == 1
@@ -146,7 +159,7 @@ class TestSendTemperature:
 
         session.post.assert_called_once_with(
             "http://10.0.0.1/api/cpu",
-            json={"temp": 45.3, "host": get_hostname()},
+            json={"temp": 45.3, "host": get_hostname(), "source": "sysfs:mock"},
             timeout=(2.0, 3.0),
         )
 
@@ -159,7 +172,7 @@ class TestSendTemperature:
         response.text = "Internal Error"
         session.post.return_value = response
 
-        result = send_temperature(session, 50.0, cfg, metrics)
+        result = send_temperature(session, 50.0, "sysfs:mock", cfg, metrics)
 
         assert result is False
         assert metrics.failed_requests == 1
@@ -171,7 +184,7 @@ class TestSendTemperature:
         session = MagicMock(spec=requests.Session)
         session.post.side_effect = requests.ConnectionError("refused")
 
-        result = send_temperature(session, 50.0, cfg, metrics)
+        result = send_temperature(session, 50.0, "sysfs:mock", cfg, metrics)
 
         assert result is False
         assert metrics.failed_requests == 1
@@ -181,6 +194,7 @@ class TestSendTemperature:
 # ---------------------------------------------------------------------------
 # compute_sleep
 # ---------------------------------------------------------------------------
+
 
 class TestComputeSleep:
     def test_no_failures_returns_interval(self) -> None:

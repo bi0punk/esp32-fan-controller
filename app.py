@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import argparse
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import signal
 import socket
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any
 
 import psutil
 import requests
@@ -24,12 +25,8 @@ import requests
 
 @dataclass
 class Config:
-    esp32_ip: str = field(
-        default_factory=lambda: os.getenv("ESP32_IP", "192.168.1.103")
-    )
-    esp32_url: str = field(
-        default_factory=lambda: os.getenv("ESP32_URL", "")
-    )
+    esp32_ip: str = field(default_factory=lambda: os.getenv("ESP32_IP", "192.168.1.103"))
+    esp32_url: str = field(default_factory=lambda: os.getenv("ESP32_URL", ""))
     interval_seconds: float = float(os.getenv("INTERVAL_SECONDS", "5"))
     http_timeout_connect: float = float(os.getenv("HTTP_TIMEOUT_CONNECT", "2"))
     http_timeout_read: float = float(os.getenv("HTTP_TIMEOUT_READ", "3"))
@@ -72,7 +69,7 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def build_config(argv: Optional[list[str]] = None) -> Config:
+def build_config(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
         description="Monitor de temperatura CPU para ESP32 Fan Controller"
     )
@@ -84,8 +81,9 @@ def build_config(argv: Optional[list[str]] = None) -> Config:
     parser.add_argument("--delta", type=float, help="Umbral mínimo de cambio (°C)")
     parser.add_argument("--env-file", default=".env", help="Ruta del archivo .env")
     parser.add_argument("--oneshot", action="store_true", help="Ejecuta un solo ciclo y termina")
-    parser.add_argument("--temp-source", choices=["auto", "psutil", "sysfs"],
-                        help="Fuente de temperatura")
+    parser.add_argument(
+        "--temp-source", choices=["auto", "psutil", "sysfs"], help="Fuente de temperatura"
+    )
     parsed = parser.parse_args(argv)
 
     load_env_file(Path(parsed.env_file))
@@ -143,8 +141,8 @@ class Metrics:
     successful_requests: int = 0
     failed_requests: int = 0
     consecutive_failures: int = 0
-    last_temp_sent: Optional[float] = None
-    last_success_time: Optional[float] = None
+    last_temp_sent: float | None = None
+    last_success_time: float | None = None
 
 
 def get_hostname() -> str:
@@ -168,7 +166,7 @@ def collect_temp_candidates_from_psutil() -> list[tuple[str, float]]:
     return candidates
 
 
-def select_best_temp(candidates: Iterable[tuple[str, float]]) -> Optional[tuple[str, float]]:
+def select_best_temp(candidates: Iterable[tuple[str, float]]) -> tuple[str, float] | None:
     items = list(candidates)
     if not items:
         return None
@@ -191,7 +189,7 @@ def select_best_temp(candidates: Iterable[tuple[str, float]]) -> Optional[tuple[
     return max(items, key=lambda x: x[1])
 
 
-def read_temp_psutil() -> tuple[Optional[float], str]:
+def read_temp_psutil() -> tuple[float | None, str]:
     try:
         selected = select_best_temp(collect_temp_candidates_from_psutil())
         if selected is None:
@@ -202,12 +200,12 @@ def read_temp_psutil() -> tuple[Optional[float], str]:
         return None, f"psutil:error:{exc}"
 
 
-def read_temp_sysfs() -> tuple[Optional[float], str]:
+def read_temp_sysfs() -> tuple[float | None, str]:
     base = Path("/sys/class/thermal")
     if not base.exists():
         return None, "sysfs:not-found"
 
-    best_value: Optional[float] = None
+    best_value: float | None = None
     best_source = "sysfs:unknown"
 
     for zone in sorted(base.glob("thermal_zone*")):
@@ -220,20 +218,22 @@ def read_temp_sysfs() -> tuple[Optional[float], str]:
             value = float(raw)
             if value > 1000:
                 value = value / 1000.0
-            ztype = type_file.read_text(encoding="utf-8").strip() if type_file.exists() else zone.name
+            ztype = (
+                type_file.read_text(encoding="utf-8").strip() if type_file.exists() else zone.name
+            )
             source = f"sysfs:{zone.name}:{ztype}"
             if best_value is None or value > best_value:
                 best_value = value
                 best_source = source
         except Exception:
-            continue
+            continue  # nosec B112 - saltar zonas térmicas no legibles y seguir con las demás
 
     if best_value is None:
         return None, "sysfs:no-valid-zones"
     return best_value, best_source
 
 
-def read_cpu_temperature(config: Config) -> tuple[Optional[float], str]:
+def read_cpu_temperature(config: Config) -> tuple[float | None, str]:
     readers = {
         "psutil": [read_temp_psutil],
         "sysfs": [read_temp_sysfs],
@@ -246,8 +246,13 @@ def read_cpu_temperature(config: Config) -> tuple[Optional[float], str]:
         if value is not None:
             if config.min_valid_temp <= value <= config.max_valid_temp:
                 return value, source
-            logging.debug("Lectura %s fuera de rango [%.1f, %.1f]: %.2f",
-                          source, config.min_valid_temp, config.max_valid_temp, value)
+            logging.debug(
+                "Lectura %s fuera de rango [%.1f, %.1f]: %.2f",
+                source,
+                config.min_valid_temp,
+                config.max_valid_temp,
+                value,
+            )
 
     return None, "no-valid-reading"
 
@@ -259,7 +264,7 @@ def send_temperature(
     config: Config,
     metrics: Metrics,
 ) -> bool:
-    payload = {
+    payload: dict[str, Any] = {
         "temp": round(temp, 1),
         "host": get_hostname(),
         "source": source,
@@ -295,7 +300,9 @@ def send_temperature(
     metrics.last_temp_sent = temp
     metrics.last_success_time = time.time()
 
-    logging.info("Enviado a ESP32: %s | fuente=%s | Respuesta: %s", payload, source, response.text.strip())
+    logging.info(
+        "Enviado a ESP32: %s | fuente=%s | Respuesta: %s", payload, source, response.text.strip()
+    )
     return True
 
 
@@ -346,7 +353,7 @@ def main() -> None:
     session = requests.Session()
     session.max_redirects = 0
 
-    last_temp: Optional[float] = None
+    last_temp: float | None = None
 
     while not _should_exit:
         cycle_start = time.monotonic()
