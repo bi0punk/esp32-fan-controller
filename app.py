@@ -118,15 +118,16 @@ def setup_logging(config: Config) -> None:
     console.setLevel(level)
     handlers.append(console)
 
-    log_path = Path(config.log_file)
-    ensure_parent(log_path)
-    file_handler = RotatingFileHandler(
-        str(log_path),
-        maxBytes=1_000_000,
-        backupCount=3,
-    )
-    file_handler.setLevel(level)
-    handlers.append(file_handler)
+    log_path = Path(config.log_file) if config.log_file.strip() else None
+    if log_path is not None:
+        ensure_parent(log_path)
+        file_handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=1_000_000,
+            backupCount=3,
+        )
+        file_handler.setLevel(level)
+        handlers.append(file_handler)
 
     logging.basicConfig(
         level=level,

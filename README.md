@@ -150,7 +150,7 @@ python app.py --ip 10.0.0.5 --interval 10 --verbose
 | `TEMP_DELTA_THRESHOLD` | `--delta` | `0.5` | Umbral mínimo de cambio (°C) |
 | `MAX_CONSECUTIVE_FAILURES` | — | `5` | Fallos antes de backoff máximo |
 | `LOG_LEVEL` | `--verbose` | `INFO` | Nivel de logging |
-| `LOG_FILE` | `--log-file` | — | Ruta a archivo de log |
+| `LOG_FILE` | `--log-file` | `logs/fan-controller.log` | Ruta a archivo de log. Vacío desactiva el logging a archivo |
 
 ## Tests / CI
 
